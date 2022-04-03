@@ -1,18 +1,19 @@
 package pomodoro
 
 import (
+	"context"
 	"errors"
 	"time"
 )
 
-// Category constants
+// category constants
 const (
 	CategoryPomodoro   = "Pomodoro"
 	CategoryShortBreak = "ShortBreak"
 	CategoryLongBreak  = "LongBreak"
 )
 
-// State constants
+// state constants
 // iota operator - first value starts at 0, and then the following value 
 // gets incremented by 1 for each following constant
 const (
@@ -57,7 +58,7 @@ type IntervalConfig struct {
 	LongBreakDuration  time.Duration
 }
 
-// Instantiate new IntervalConfig
+// instantiate new IntervalConfig
 func NewConfig(repo Repository, pomodoro, shortBreak, longBreak time.Duration) *IntervalConfig {
 	config := &IntervalConfig{
 		repo: repo,
@@ -73,4 +74,105 @@ func NewConfig(repo Repository, pomodoro, shortBreak, longBreak time.Duration) *
 	if longBreak > 0 { config.LongBreakDuration = longBreak }
 
 	return config
+}
+/**
+* Takes a reference to the repository as input and returns
+* the next interval category as a string or an error.
+* Retrieves the last interval from the repository
+* and determines the next interval category.
+* After each Pomodoro interval, there’s a short break
+* and after four Pomodoros, there’s a long break.
+*/
+func nextCategory(r Repository) (string, error) {
+	lastInterval, err := r.Last()
+	if err != nil && err == ErrNoIntervals {
+		return CategoryPomodoro, nil
+	}
+
+	if err != nil {
+		return "", err
+	}
+
+	if lastInterval.Category == CategoryLongBreak || lastInterval.Category == CategoryShortBreak {
+		return CategoryPomodoro, nil
+	}
+
+	lastBreaks, err := r.Breaks(3)
+	if err != nil {
+		return "", err
+	}
+
+	if len(lastBreaks) < 3 {
+		return CategoryShortBreak, err
+	}
+
+	for _, i := range lastBreaks {
+		if i.Category == CategoryLongBreak {
+			return CategoryShortBreak, nil
+		}
+	}
+
+	return CategoryLongBreak, nil
+}
+
+// used to perform tasks while the interval executes
+type Callback func(Interval)
+
+/**
+* This function uses the time.Ticker type and a loop to execute actions every
+* second while the interval time progresses. It uses a select statement to take
+* actions, executing periodically when the time.Ticker goes off,
+* finishing successfully when the interval time expires
+* or canceling when a signal is received from Context.
+*/
+func tick(ctx context.Context, id int64, config *IntervalConfig, start, periodic, end Callback) error {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	interval, err := config.repo.ByID(id)
+	if err != nil {
+		return err
+	}
+
+	expire := time.After(interval.PlannedDuration - interval.ActualDuration)
+
+	start(interval)
+
+	for {
+		select {
+		case <- ticker.C:
+			interval, err := config.repo.ByID(id)
+			if err != nil {
+				return err
+			}
+
+			if interval.State == StatePaused {
+				return nil
+			}
+
+			interval.ActualDuration += time.Second
+			if err := config.repo.Update(interval); err != nil {
+				return err
+			}
+
+			periodic(interval)
+		case <- expire:
+			interval, err := config.repo.ByID(id)
+			if err != nil {
+				return err
+			}
+
+			interval.State = StateDone
+
+			end(interval)
+
+			return config.repo.Update(interval)
+		case <- ctx.Done():
+			interval, err := config.repo.ByID(id)
+			if err != nil {
+				return err
+			}
+			interval.State = StateCancelled
+		}
+	}
 }
